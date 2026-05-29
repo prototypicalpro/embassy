@@ -48,7 +48,7 @@ const FEATURE_UNIT_ID: u8 = 0x02;
 const OUTPUT_UNIT_ID: u8 = 0x03;
 
 /// Audio channel count in stream
-const MAX_AUDIO_CHANNEL_COUNT: usize = 0x02;
+const MAX_AUDIO_CHANNEL_COUNT: usize = 0x01;
 
 // Maximum number of supported discrete sample rates.
 fn calculate_max_packet_size(sample_rate_hz: u32, num_channels: u8, b_subframe_size: u8) -> u16 {
