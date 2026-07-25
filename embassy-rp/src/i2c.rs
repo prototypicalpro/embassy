@@ -283,16 +283,13 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
 
 impl<'d, T: Instance> I2c<'d, T, AsyncDMA> {
     /// Create a new driver instance in async mode.
-    pub fn new_async_dma<TxDma: ChannelInstance, RxDma: ChannelInstance>(
+    pub fn new_async_dma<TxDma: ChannelInstance>(
         peri: Peri<'d, T>,
         scl: Peri<'d, impl SclPin<T>>,
         sda: Peri<'d, impl SdaPin<T>>,
         tx_dma: Peri<'d, TxDma>,
         // rx_dma: Peri<'d, RxDma>,
-        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>
-        + Binding<TxDma::Interrupt, dma::InterruptHandler<TxDma>>
-        + interrupt::typelevel::Binding<RxDma::Interrupt, dma::InterruptHandler<RxDma>>
-        + 'd,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + Binding<TxDma::Interrupt, dma::InterruptHandler<TxDma>> + 'd,
         config: Config,
     ) -> Self {
         let tx_dma = dma::Channel::new(tx_dma, _irq);
@@ -396,7 +393,7 @@ impl<'d, T: Instance> I2c<'d, T, AsyncDMA> {
 impl<'d, T: Instance> AsyncImpl for I2c<'d, T, AsyncDMA> {
     async fn write_async_internal(&mut self, bytes: &[u8], send_stop: bool) -> Result<(), Error> {
         let p = T::regs();
-        let mut bytes_dma: [u16; 768] = [0; _];
+        let mut bytes_dma: [u16; 128] = [0; _];
 
         if bytes.len() > bytes_dma.len() {
             return Err(Error::InvalidWriteBufferLength);
@@ -406,19 +403,39 @@ impl<'d, T: Instance> AsyncImpl for I2c<'d, T, AsyncDMA> {
             let mut cmd = IcDataCmd::default();
             cmd.set_cmd(false);
             cmd.set_dat(*b);
-            if i == bytes.len() - 1 {
-                cmd.set_stop(send_stop);
-            }
+            cmd.set_stop(send_stop && i == bytes.len() - 1);
             *c = cmd.0 as u16;
         }
 
-        let tx_transfer = unsafe {
-            self.tx_dma.as_mut().unwrap().write(
-                &bytes_dma[..bytes.len()],
-                p.ic_data_cmd().as_ptr() as *mut _,
-                T::TX_DREQ,
-                false,
-            )
+        let mut tx_transfer = async || {
+            unsafe {
+                self.tx_dma
+                    .as_mut()
+                    .unwrap()
+                    .write(
+                        &bytes_dma[..bytes.len()],
+                        p.ic_data_cmd().as_ptr() as *mut _,
+                        T::TX_DREQ,
+                        false,
+                    )
+                    .await;
+            }
+
+            future::poll_fn(|cx| {
+                // Register prior to checking the condition
+                T::waker().register(cx.waker());
+
+                if p.ic_txflr().read().txflr() == 0 {
+                    Poll::Ready(())
+                } else {
+                    p.ic_tx_tl().write(|w| w.set_tx_tl(0));
+                    p.ic_intr_mask().modify(|w| {
+                        w.set_m_tx_empty(true);
+                    });
+                    Poll::Pending
+                }
+            })
+            .await;
         };
 
         let err = future::poll_fn(|cx| {
@@ -436,23 +453,23 @@ impl<'d, T: Instance> AsyncImpl for I2c<'d, T, AsyncDMA> {
             }
         });
 
-        let abort_reason = match select(tx_transfer, err).await {
+        let abort_reason = match select(tx_transfer(), err).await {
             Either::First(()) => Ok(()),
             Either::Second(()) => {
-                self.tx_dma.as_mut().unwrap().cancel();
-                self.read_and_clear_abort_reason()
+                if let error @ Err(_) = self.read_and_clear_abort_reason() {
+                    self.tx_dma.as_mut().unwrap().cancel();
+                    return error;
+                }
+                Ok(())
             }
         };
+
         self.wait_stop_det(abort_reason, send_stop).await
     }
 }
 
 impl<'d, T: Instance> AsyncImpl for I2c<'d, T, Async> {
-    async fn write_async_internal(
-        &mut self,
-        bytes: &[u8],
-        send_stop: bool,
-    ) -> Result<(), Error> {
+    async fn write_async_internal(&mut self, bytes: &[u8], send_stop: bool) -> Result<(), Error> {
         let p = T::regs();
 
         let mut bytes = bytes.into_iter().peekable();
@@ -513,11 +530,7 @@ where
     I2c<'d, T, M>: AsyncImpl,
 {
     /// Write to address from buffer asynchronously.
-    pub async fn write_async(
-        &mut self,
-        addr: impl Into<u16>,
-        bytes: &[u8],
-    ) -> Result<(), Error> {
+    pub async fn write_async(&mut self, addr: impl Into<u16>, bytes: &[u8]) -> Result<(), Error> {
         Self::setup(addr.into())?;
         self.write_async_internal(bytes, true).await
     }
@@ -923,7 +936,7 @@ impl<'d, A, T, M: Mode + AsyncShared> embedded_hal_async::i2c::I2c<A> for I2c<'d
 where
     A: embedded_hal_async::i2c::AddressMode + Into<u16> + 'static,
     T: Instance + 'd,
-    I2c<'d, T, M>: AsyncImpl
+    I2c<'d, T, M>: AsyncImpl,
 {
     async fn read(&mut self, address: A, read: &mut [u8]) -> Result<(), Self::Error> {
         self.read_async(address, read).await
