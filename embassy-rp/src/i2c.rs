@@ -5,13 +5,16 @@ use core::future;
 use core::marker::PhantomData;
 use core::task::Poll;
 
+use embassy_futures::select::{Either, select};
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 use pac::i2c;
 
+use crate::dma::{Channel, ChannelInstance};
 use crate::gpio::AnyPin;
 use crate::interrupt::typelevel::{Binding, Interrupt};
-use crate::{interrupt, pac, peripherals};
+use crate::{dma, interrupt, pac, peripherals};
+use pac::i2c::regs::IcDataCmd;
 
 /// I2C error abort reason
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -88,9 +91,10 @@ impl Default for Config {
 pub const FIFO_SIZE: u8 = 16;
 
 /// I2C driver.
-#[derive(Debug)]
 pub struct I2c<'d, T: Instance, M: Mode> {
     phantom: PhantomData<(&'d mut T, M)>,
+    tx_dma: Option<Channel<'d>>,
+    // rx_dma: Option<Channel<'d>>,
 }
 
 impl<'d, T: Instance> I2c<'d, T, Blocking> {
@@ -101,31 +105,11 @@ impl<'d, T: Instance> I2c<'d, T, Blocking> {
         sda: Peri<'d, impl SdaPin<T>>,
         config: Config,
     ) -> Self {
-        Self::new_inner(peri, scl.into(), sda.into(), config)
+        Self::new_inner(peri, scl.into(), sda.into(), config, None)
     }
 }
 
-impl<'d, T: Instance> I2c<'d, T, Async> {
-    /// Create a new driver instance in async mode.
-    pub fn new_async(
-        peri: Peri<'d, T>,
-        scl: Peri<'d, impl SclPin<T>>,
-        sda: Peri<'d, impl SdaPin<T>>,
-        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
-        config: Config,
-    ) -> Self {
-        let i2c = Self::new_inner(peri, scl.into(), sda.into(), config);
-
-        let r = T::regs();
-
-        // mask everything initially
-        r.ic_intr_mask().write_value(i2c::regs::IcIntrMask(0));
-        T::Interrupt::unpend();
-        unsafe { T::Interrupt::enable() };
-
-        i2c
-    }
-
+impl<'d, T: Instance, M: Mode + AsyncShared> I2c<'d, T, M> {
     /// Calls `f` to check if we are ready or not.
     /// If not, `g` is called once(to eg enable the required interrupts).
     /// The waker will always be registered prior to calling `f`.
@@ -229,65 +213,6 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
         self.wait_stop_det(abort_reason, send_stop).await
     }
 
-    async fn write_async_internal(
-        &mut self,
-        bytes: impl IntoIterator<Item = u8>,
-        send_stop: bool,
-    ) -> Result<(), Error> {
-        let p = T::regs();
-
-        let mut bytes = bytes.into_iter().peekable();
-
-        let res = 'xmit: loop {
-            let tx_fifo_space = Self::tx_fifo_capacity();
-
-            for _ in 0..tx_fifo_space {
-                if let Some(byte) = bytes.next() {
-                    let last = bytes.peek().is_none();
-
-                    p.ic_data_cmd().write(|w| {
-                        w.set_stop(last && send_stop);
-                        w.set_cmd(false);
-                        w.set_dat(byte);
-                    });
-                } else {
-                    break 'xmit Ok(());
-                }
-            }
-
-            let res = self
-                .wait_on(
-                    |me| {
-                        if let abort_reason @ Err(_) = me.read_and_clear_abort_reason() {
-                            Poll::Ready(abort_reason)
-                        } else if !Self::tx_fifo_full() {
-                            // resume if there's any space free in the tx fifo
-                            Poll::Ready(Ok(()))
-                        } else {
-                            Poll::Pending
-                        }
-                    },
-                    |_me| {
-                        // Set tx "free" threshold a little high so that we get
-                        // woken before the fifo completely drains to minimize
-                        // transfer stalls.
-                        p.ic_tx_tl().write(|w| w.set_tx_tl(1));
-
-                        p.ic_intr_mask().modify(|w| {
-                            w.set_m_tx_empty(true);
-                            w.set_m_tx_abrt(true);
-                        })
-                    },
-                )
-                .await;
-            if res.is_err() {
-                break res;
-            }
-        };
-
-        self.wait_stop_det(res, send_stop).await
-    }
-
     /// Helper to wait for a stop bit, for both tx and rx. If we had an abort,
     /// then we'll get a hardware-generated stop, otherwise wait for a stop if
     /// we're expecting it.
@@ -332,12 +257,266 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
         Self::setup(addr.into())?;
         self.read_async_internal(buffer, true, true).await
     }
+}
 
+impl<'d, T: Instance> I2c<'d, T, Async> {
+    /// Create a new driver instance in async mode.
+    pub fn new_async(
+        peri: Peri<'d, T>,
+        scl: Peri<'d, impl SclPin<T>>,
+        sda: Peri<'d, impl SdaPin<T>>,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
+        config: Config,
+    ) -> Self {
+        let i2c = Self::new_inner(peri, scl.into(), sda.into(), config, None);
+
+        let r = T::regs();
+
+        // mask everything initially
+        r.ic_intr_mask().write_value(i2c::regs::IcIntrMask(0));
+        T::Interrupt::unpend();
+        unsafe { T::Interrupt::enable() };
+
+        i2c
+    }
+}
+
+impl<'d, T: Instance> I2c<'d, T, AsyncDMA> {
+    /// Create a new driver instance in async mode.
+    pub fn new_async_dma<TxDma: ChannelInstance, RxDma: ChannelInstance>(
+        peri: Peri<'d, T>,
+        scl: Peri<'d, impl SclPin<T>>,
+        sda: Peri<'d, impl SdaPin<T>>,
+        tx_dma: Peri<'d, TxDma>,
+        // rx_dma: Peri<'d, RxDma>,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>
+        + Binding<TxDma::Interrupt, dma::InterruptHandler<TxDma>>
+        + interrupt::typelevel::Binding<RxDma::Interrupt, dma::InterruptHandler<RxDma>>
+        + 'd,
+        config: Config,
+    ) -> Self {
+        let tx_dma = dma::Channel::new(tx_dma, _irq);
+        // let rx_dma = dma::Channel::new(rx_dma, _irq);
+        let i2c = Self::new_inner(peri, scl.into(), sda.into(), config, Some(tx_dma));
+
+        let r = T::regs();
+
+        // mask everything initially
+        r.ic_intr_mask().write_value(i2c::regs::IcIntrMask(0));
+        T::Interrupt::unpend();
+        unsafe { T::Interrupt::enable() };
+
+        i2c
+    }
+
+    // async fn read_async_internal(&mut self, buffer: &mut [u8], restart: bool, send_stop: bool) -> Result<(), Error> {
+    //     if buffer.is_empty() {
+    //         return Err(Error::InvalidReadBufferLength);
+    //     }
+
+    //     let p = T::regs();
+    //     let mut tx_cnt = buffer.len();
+    //     if restart {
+    //         p.ic_data_cmd().write(|w| {
+    //             w.set_restart(true);
+    //             w.set_cmd(true);
+    //         });
+    //         tx_cnt -= 1;
+    //     }
+
+    //     if send_stop {
+    //         tx_cnt -= 1;
+    //     }
+
+    //     static mut CMD: IcDataCmd = IcDataCmd::default().set_cmd(true);
+    //     static mut STOP: IcDataCmd = IcDataCmd::default().set_cmd(true).set_stop(true);
+    //     let tx_ch = self.tx_dma.as_mut().unwrap();
+    //     let tx_transfer = unsafe {
+    //         // If we don't assign future to a variable, the data register pointer
+    //         // is held across an await and makes the future non-Send.
+    //         self.tx_dma.as_mut().unwrap().write_val(
+    //             core::ptr::addr_of_mut!(CMD),
+    //             tx_cnt,
+    //             p.ic_data_cmd().to_ptr(),
+    //             T::TX_DREQ,
+    //         )
+    //         if send_stop {
+    //             stop_transfer.await;
+    //         }
+    //     };
+    //     let stop_transfer = unsafe {
+    //         self.tx_dma.as_mut().unwrap().write_val(
+    //             core::ptr::addr_of_mut!(STOP),
+    //             1,
+    //             p.ic_data_cmd().to_ptr(),
+    //             T::TX_DREQ,
+    //         )
+    //     };
+    //     let rx_transfer = unsafe {
+    //         self.rx_dma
+    //             .as_mut()
+    //             .unwrap()
+    //             .read(p.ic_data_cmd().to_ptr(), buffer, T::RX_DREQ, false)
+    //     };
+    //     let txrx = join(rx_transfer, async move || {
+    //         tx_transfer.await;
+
+    //     });
+
+    //     let err = self
+    //         .wait_on(
+    //             |me| {
+    //                 if let Err(abort_reason) = me.read_and_clear_abort_reason() {
+    //                     Poll::Ready(Err(abort_reason))
+    //                 } else {
+    //                     Poll::Pending
+    //                 }
+    //             },
+    //             |_me| {
+    //                 p.ic_intr_mask().modify(|w| {
+    //                     w.set_m_tx_abrt(true);
+    //                 });
+    //             },
+    //         );
+
+    //     let mut abort_reason = Ok(());
+    //     match select(txrx, err) {
+    //         Err(reason) => {
+    //             self.tx_dma.unwrap().cancel();
+    //             self.rx_dma.unwrap().cancel();
+    //             abort_reason = Err(reason);
+    //         },
+    //         Ok(()) => ()
+    //     }
+
+    //     self.wait_stop_det(abort_reason, send_stop).await
+    // }
+}
+
+impl<'d, T: Instance> AsyncImpl for I2c<'d, T, AsyncDMA> {
+    async fn write_async_internal(&mut self, bytes: &[u8], send_stop: bool) -> Result<(), Error> {
+        let p = T::regs();
+        let mut bytes_dma: [u16; 768] = [0; _];
+
+        if bytes.len() > bytes_dma.len() {
+            return Err(Error::InvalidWriteBufferLength);
+        }
+
+        for (i, (b, c)) in bytes.iter().zip(bytes_dma.iter_mut()).enumerate() {
+            let mut cmd = IcDataCmd::default();
+            cmd.set_cmd(false);
+            cmd.set_dat(*b);
+            if i == bytes.len() - 1 {
+                cmd.set_stop(send_stop);
+            }
+            *c = cmd.0 as u16;
+        }
+
+        let tx_transfer = unsafe {
+            self.tx_dma.as_mut().unwrap().write(
+                &bytes_dma[..bytes.len()],
+                p.ic_data_cmd().as_ptr() as *mut _,
+                T::TX_DREQ,
+                false,
+            )
+        };
+
+        let err = future::poll_fn(|cx| {
+            // Register prior to checking the condition
+            T::waker().register(cx.waker());
+
+            let abort_reason = p.ic_tx_abrt_source().read();
+            if abort_reason.0 != 0 {
+                Poll::Ready(())
+            } else {
+                p.ic_intr_mask().modify(|w| {
+                    w.set_m_tx_abrt(true);
+                });
+                Poll::Pending
+            }
+        });
+
+        let abort_reason = match select(tx_transfer, err).await {
+            Either::First(()) => Ok(()),
+            Either::Second(()) => {
+                self.tx_dma.as_mut().unwrap().cancel();
+                self.read_and_clear_abort_reason()
+            }
+        };
+        self.wait_stop_det(abort_reason, send_stop).await
+    }
+}
+
+impl<'d, T: Instance> AsyncImpl for I2c<'d, T, Async> {
+    async fn write_async_internal(
+        &mut self,
+        bytes: &[u8],
+        send_stop: bool,
+    ) -> Result<(), Error> {
+        let p = T::regs();
+
+        let mut bytes = bytes.into_iter().peekable();
+
+        let res = 'xmit: loop {
+            let tx_fifo_space = Self::tx_fifo_capacity();
+
+            for _ in 0..tx_fifo_space {
+                if let Some(byte) = bytes.next() {
+                    let last = bytes.peek().is_none();
+
+                    p.ic_data_cmd().write(|w| {
+                        w.set_stop(last && send_stop);
+                        w.set_cmd(false);
+                        w.set_dat(*byte);
+                    });
+                } else {
+                    break 'xmit Ok(());
+                }
+            }
+
+            let res = self
+                .wait_on(
+                    |me| {
+                        if let abort_reason @ Err(_) = me.read_and_clear_abort_reason() {
+                            Poll::Ready(abort_reason)
+                        } else if !Self::tx_fifo_full() {
+                            // resume if there's any space free in the tx fifo
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        }
+                    },
+                    |_me| {
+                        // Set tx "free" threshold a little high so that we get
+                        // woken before the fifo completely drains to minimize
+                        // transfer stalls.
+                        p.ic_tx_tl().write(|w| w.set_tx_tl(1));
+
+                        p.ic_intr_mask().modify(|w| {
+                            w.set_m_tx_empty(true);
+                            w.set_m_tx_abrt(true);
+                        })
+                    },
+                )
+                .await;
+            if res.is_err() {
+                break res;
+            }
+        };
+
+        self.wait_stop_det(res, send_stop).await
+    }
+}
+
+impl<'d, T: Instance, M: Mode + AsyncShared> I2c<'d, T, M>
+where
+    I2c<'d, T, M>: AsyncImpl,
+{
     /// Write to address from buffer asynchronously.
     pub async fn write_async(
         &mut self,
         addr: impl Into<u16>,
-        bytes: impl IntoIterator<Item = u8>,
+        bytes: &[u8],
     ) -> Result<(), Error> {
         Self::setup(addr.into())?;
         self.write_async_internal(bytes, true).await
@@ -347,7 +526,7 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
     pub async fn write_read_async(
         &mut self,
         addr: impl Into<u16>,
-        bytes: impl IntoIterator<Item = u8>,
+        bytes: &[u8],
         buffer: &mut [u8],
     ) -> Result<(), Error> {
         Self::setup(addr.into())?;
@@ -390,7 +569,14 @@ where
 }
 
 impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
-    fn new_inner(_peri: Peri<'d, T>, scl: Peri<'d, AnyPin>, sda: Peri<'d, AnyPin>, config: Config) -> Self {
+    fn new_inner(
+        _peri: Peri<'d, T>,
+        scl: Peri<'d, AnyPin>,
+        sda: Peri<'d, AnyPin>,
+        config: Config,
+        tx_dma: Option<Channel<'d>>,
+        // rx_dma: Option<Channel<'d>>,
+    ) -> Self {
         let reset = T::reset();
         crate::reset::reset(reset);
         crate::reset::unreset_wait(reset);
@@ -399,7 +585,11 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
         set_up_i2c_pin(&scl, config.scl_pullup);
         set_up_i2c_pin(&sda, config.sda_pullup);
 
-        let mut me = Self { phantom: PhantomData };
+        let mut me = Self {
+            phantom: PhantomData,
+            tx_dma,
+            // rx_dma,
+        };
 
         if let Err(e) = me.set_config_inner(&config) {
             panic!("Error configuring i2c: {:?}", e);
@@ -467,6 +657,11 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
             .write(|w| w.set_ic_fs_spklen(if lcnt < 16 { 1 } else { (lcnt / 16) as u8 }));
         p.ic_sda_hold()
             .modify(|w| w.set_ic_sda_tx_hold(sda_tx_hold_count as u16));
+
+        p.ic_dma_cr().write(|w| {
+            // w.set_rdmae(self.rx_dma.is_some());
+            w.set_tdmae(self.tx_dma.is_some());
+        });
 
         p.ic_enable().write(|w| w.set_enable(true));
 
@@ -724,21 +919,22 @@ impl<'d, T: Instance, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, T, M> {
     }
 }
 
-impl<'d, A, T> embedded_hal_async::i2c::I2c<A> for I2c<'d, T, Async>
+impl<'d, A, T, M: Mode + AsyncShared> embedded_hal_async::i2c::I2c<A> for I2c<'d, T, M>
 where
     A: embedded_hal_async::i2c::AddressMode + Into<u16> + 'static,
     T: Instance + 'd,
+    I2c<'d, T, M>: AsyncImpl
 {
     async fn read(&mut self, address: A, read: &mut [u8]) -> Result<(), Self::Error> {
         self.read_async(address, read).await
     }
 
     async fn write(&mut self, address: A, write: &[u8]) -> Result<(), Self::Error> {
-        self.write_async(address, write.iter().copied()).await
+        self.write_async(address, write).await
     }
 
     async fn write_read(&mut self, address: A, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error> {
-        self.write_read_async(address, write.iter().copied(), read).await
+        self.write_read_async(address, write, read).await
     }
 
     async fn transaction(
@@ -763,7 +959,7 @@ where
                     self.read_async_internal(buffer, false, last).await?;
                 }
                 Operation::Write(buffer) => {
-                    self.write_async_internal(buffer.iter().cloned(), last).await?;
+                    self.write_async_internal(buffer, last).await?;
                 }
             }
         }
@@ -780,7 +976,14 @@ impl<'d, T: Instance, M: Mode> embassy_embedded_hal::SetConfig for I2c<'d, T, M>
     }
 }
 
+pub trait AsyncImpl {
+    async fn write_async_internal(&mut self, bytes: &[u8], send_stop: bool) -> Result<(), Error>;
+}
+
 pub(crate) trait SealedInstance {
+    const TX_DREQ: pac::dma::vals::TreqSel;
+    const RX_DREQ: pac::dma::vals::TreqSel;
+
     fn regs() -> crate::pac::i2c::I2c;
     fn reset() -> crate::pac::resets::regs::Peripherals;
     fn waker() -> &'static AtomicWaker;
@@ -791,6 +994,8 @@ trait SealedMode {}
 /// Driver mode.
 #[allow(private_bounds)]
 pub trait Mode: SealedMode {}
+
+pub trait AsyncShared {}
 
 macro_rules! impl_mode {
     ($name:ident) => {
@@ -804,8 +1009,14 @@ pub struct Blocking;
 /// Async mode.
 pub struct Async;
 
+pub struct AsyncDMA;
+
 impl_mode!(Blocking);
 impl_mode!(Async);
+impl_mode!(AsyncDMA);
+
+impl AsyncShared for Async {}
+impl AsyncShared for AsyncDMA {}
 
 /// I2C instance.
 #[allow(private_bounds)]
@@ -815,8 +1026,11 @@ pub trait Instance: SealedInstance + PeripheralType {
 }
 
 macro_rules! impl_instance {
-    ($type:ident, $irq:ident, $reset:ident) => {
+    ($type:ident, $irq:ident, $reset:ident, $tx_dreq:expr, $rx_dreq:expr) => {
         impl SealedInstance for peripherals::$type {
+            const TX_DREQ: pac::dma::vals::TreqSel = $tx_dreq;
+            const RX_DREQ: pac::dma::vals::TreqSel = $rx_dreq;
+
             #[inline]
             fn regs() -> pac::i2c::I2c {
                 pac::$type
@@ -842,8 +1056,20 @@ macro_rules! impl_instance {
     };
 }
 
-impl_instance!(I2C0, I2C0_IRQ, set_i2c0);
-impl_instance!(I2C1, I2C1_IRQ, set_i2c1);
+impl_instance!(
+    I2C0,
+    I2C0_IRQ,
+    set_i2c0,
+    pac::dma::vals::TreqSel::I2C0_TX,
+    pac::dma::vals::TreqSel::I2C0_RX
+);
+impl_instance!(
+    I2C1,
+    I2C1_IRQ,
+    set_i2c1,
+    pac::dma::vals::TreqSel::I2C1_TX,
+    pac::dma::vals::TreqSel::I2C1_RX
+);
 
 /// SDA pin.
 pub trait SdaPin<T: Instance>: crate::gpio::Pin {}

@@ -230,6 +230,29 @@ impl<'d> Channel<'d> {
         Transfer::new(self.reborrow())
     }
 
+    /// Repetedly write a val to peripeheral.
+    ///
+    /// SAFETY: `to` must point to a valid location reachable by DMA.
+    pub unsafe fn write_val<'a, W: Word>(
+        &'a mut self,
+        from: *const W,
+        count: usize,
+        to: *mut W,
+        dreq: vals::TreqSel,
+    ) -> Transfer<'a> {
+        self.configure(
+            from as *const u32,
+            to as *mut u32,
+            count,
+            W::size(),
+            false,
+            false,
+            dreq,
+            false,
+        );
+        Transfer::new(self.reborrow())
+    }
+
     /// DMA copy between memory regions.
     ///
     /// SAFETY: Slices must point to locations reachable by DMA.
@@ -248,6 +271,13 @@ impl<'d> Channel<'d> {
             false,
         );
         Transfer::new(self.reborrow())
+    }
+
+    pub fn cancel<'a>(&'a mut self) {
+        let p = self.regs();
+        p.ctrl_trig().write(|w| {
+            w.set_en(false);
+        });
     }
 }
 
